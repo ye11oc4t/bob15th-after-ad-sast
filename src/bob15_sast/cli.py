@@ -17,7 +17,14 @@ import typer
 from .adapters import CodeQLAdapter, SemgrepAdapter, TrivyAdapter
 from .ai import AIProviderUnavailable, MockTriageProvider, OpenAITriageProvider, TriageProvider
 from .jsonio import write_json
-from .pipeline import load_findings, public_finding, run_pipeline
+from .pipeline import (
+    DEFAULT_MAX_AI_GROUPS,
+    DEFAULT_MAX_FINDINGS,
+    DEFAULT_MAX_GROUPS,
+    load_findings,
+    public_finding,
+    run_pipeline,
+)
 from .redaction import redact, redact_text
 from .sarif import SarifParseError
 
@@ -106,6 +113,13 @@ def demo(
     output: Annotated[Path, typer.Option("--output", "-o")] = Path("artifacts/demo"),
     ai: Annotated[str, typer.Option("--ai")] = "mock",
     model: Annotated[str | None, typer.Option("--model")] = None,
+    max_ai_groups: Annotated[int, typer.Option("--max-ai-groups", min=0)] = (
+        DEFAULT_MAX_AI_GROUPS
+    ),
+    max_findings: Annotated[int, typer.Option("--max-findings", min=0)] = (
+        DEFAULT_MAX_FINDINGS
+    ),
+    max_groups: Annotated[int, typer.Option("--max-groups", min=0)] = DEFAULT_MAX_GROUPS,
 ) -> None:
     """Run the full pipeline using only the repository's synthetic SARIF fixture."""
 
@@ -116,6 +130,9 @@ def demo(
                 service="synthetic",
                 output_root=output,
                 provider=_provider(ai, model),
+                max_ai_groups=max_ai_groups,
+                max_findings=max_findings,
+                max_groups=max_groups,
             )
     except (AIProviderUnavailable, OSError, ValueError, SarifParseError) as error:
         typer.echo(f"demo failed: {_console_text(error)}", err=True)
@@ -133,22 +150,64 @@ def analyze(
     target: Annotated[Path, typer.Argument(exists=True, file_okay=False, readable=True)],
     scanner: Annotated[list[str] | None, typer.Option("--scanner")] = None,
     service: Annotated[str | None, typer.Option("--service", "-s")] = None,
-    output: Annotated[Path, typer.Option("--output", "-o")] = Path("artifacts/scans"),
+    output: Annotated[Path | None, typer.Option("--output", "-o")] = None,
     ai: Annotated[str, typer.Option("--ai")] = "none",
     model: Annotated[str | None, typer.Option("--model")] = None,
     codeql_language: Annotated[str | None, typer.Option("--codeql-language")] = None,
     semgrep_config: Annotated[Path | None, typer.Option("--semgrep-config")] = None,
+    trivy_cache_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--trivy-cache-dir",
+            exists=True,
+            file_okay=False,
+            readable=True,
+            writable=True,
+        ),
+    ] = None,
     include_source: Annotated[bool, typer.Option("--include-source")] = False,
+    max_ai_groups: Annotated[int, typer.Option("--max-ai-groups", min=0)] = (
+        DEFAULT_MAX_AI_GROUPS
+    ),
+    max_findings: Annotated[int, typer.Option("--max-findings", min=0)] = (
+        DEFAULT_MAX_FINDINGS
+    ),
+    max_groups: Annotated[int, typer.Option("--max-groups", min=0)] = DEFAULT_MAX_GROUPS,
 ) -> None:
     """Run selected local scanners, then normalize and triage their SARIF output."""
 
+    if os.name != "posix":
+        typer.echo(
+            "analysis failed: local scanner execution currently requires POSIX "
+            "process-group termination; use ingest for externally generated SARIF",
+            err=True,
+        )
+        raise typer.Exit(code=2)
     target = target.resolve()
+    resolved_output = output.expanduser().resolve() if output is not None else None
+    if resolved_output is not None and (
+        resolved_output == target or resolved_output.is_relative_to(target)
+    ):
+        raise typer.BadParameter("--output must be outside the untrusted target tree")
     selected = tuple(dict.fromkeys(name.casefold() for name in (scanner or ["semgrep"])))
     unknown = sorted(set(selected) - {"semgrep", "codeql", "trivy"})
     if unknown:
         raise typer.BadParameter(f"unknown scanner(s): {', '.join(unknown)}")
     if "codeql" in selected and codeql_language is None:
         raise typer.BadParameter("--codeql-language is required with --scanner codeql")
+    if "trivy" in selected:
+        if trivy_cache_dir is None:
+            raise typer.BadParameter(
+                "--trivy-cache-dir is required with --scanner trivy; pre-populate "
+                "the cache outside the target before an offline scan"
+            )
+        trivy_cache_dir = trivy_cache_dir.expanduser().resolve()
+        if trivy_cache_dir == target or trivy_cache_dir.is_relative_to(target):
+            raise typer.BadParameter(
+                "--trivy-cache-dir must be outside the untrusted target tree"
+            )
+    if resolved_output is None:
+        resolved_output = Path(tempfile.mkdtemp(prefix="bob15-sast-artifacts-"))
 
     try:
         provider = _provider(ai, model)
@@ -179,7 +238,9 @@ def analyze(
                         database_path=temporary / "codeql-db",
                     ).scan(target, result_path)
                 else:
-                    execution = TrivyAdapter().scan(target, result_path)
+                    execution = TrivyAdapter(cache_dir=trivy_cache_dir).scan(
+                        target, result_path
+                    )
 
                 if not execution.succeeded or not execution.output_path.is_file():
                     detail = _console_text(execution.result.stderr.strip()) or (
@@ -191,11 +252,14 @@ def analyze(
             pipeline_result = run_pipeline(
                 sarif_paths,
                 service=service or target.name,
-                output_root=output,
+                output_root=resolved_output,
                 source_root=target,
                 repo_root=target,
                 provider=provider,
                 include_source_evidence=include_source,
+                max_ai_groups=max_ai_groups,
+                max_findings=max_findings,
+                max_groups=max_groups,
             )
     except (
         AIProviderUnavailable,

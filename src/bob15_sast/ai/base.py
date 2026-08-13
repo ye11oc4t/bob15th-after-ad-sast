@@ -29,6 +29,7 @@ EvidenceKind = Literal[
     "test",
     "other",
 ]
+_SAFE_EVIDENCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z")
 
 _NEGATED_CONFIRMATION = re.compile(
     r"\b(?:not|never)\s+(?:an?\s+)?confirmed\b|"
@@ -58,13 +59,20 @@ class EvidenceReference(BaseModel):
     evidence_id: str = Field(min_length=1, max_length=200)
     kind: EvidenceKind
     content: str = Field(min_length=1, max_length=24_000)
-    location: str | None
+    location: str | None = Field(max_length=2_000)
 
     @field_validator("evidence_id", "content")
     @classmethod
     def reject_blank_values(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("evidence fields may not be blank")
+        return value
+
+    @field_validator("evidence_id")
+    @classmethod
+    def require_safe_identifier(cls, value: str) -> str:
+        if _SAFE_EVIDENCE_ID.fullmatch(value) is None:
+            raise ValueError("evidence ID must be a safe single-line identifier")
         return value
 
 
@@ -124,6 +132,8 @@ class TriageAssessment(BaseModel):
         normalized = [value.strip() for value in values]
         if any(not value for value in normalized):
             raise ValueError("at least one non-blank evidence ID is required")
+        if any(_SAFE_EVIDENCE_ID.fullmatch(value) is None for value in normalized):
+            raise ValueError("assessment evidence IDs must be safe identifiers")
         if len(normalized) != len(set(normalized)):
             raise ValueError("assessment evidence IDs must be unique")
         return normalized

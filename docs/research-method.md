@@ -9,6 +9,8 @@
 - **RQ3:** AI 보조 설명·그룹화가 사람의 판정을 바꾸지 않으면서 검토 시간을 단축하는가?
 - **RQ4:** 생성된 회귀 테스트가 패치 제거 또는 우회 변형을 다시 탐지할 수 있는가?
 
+현재 공개 MVP는 SARIF 정규화, 보수적 root-cause grouping, 스캐너 요약·SARIF dataflow·선택적 source 증거 묶음, 선택적 AI triage와 Markdown 보고서까지 구현합니다. 따라서 현재 코드로 직접 실험 가능한 범위는 RQ1의 정규화·그룹화 일부와 RQ3의 검토 보조 일부입니다. patch·configuration·runtime evidence importer, 자동 상태 전이와 회귀 테스트 생성·실행이 필요한 RQ2·RQ4는 후속 실험 계획입니다.
+
 ## 2. 시간 순서에 따른 연구 단계
 
 ### 2.1 개요
@@ -41,11 +43,11 @@ Semgrep과 CodeQL 등 기존 분석기 결과를 수집하고, 중복·비도달
 
 #### 2.4.3 사용자 정의 분석 도구
 
-본 저장소의 AI 보조 SAST는 이 시점 이후 시작한 후속 연구입니다. 기존 도구의 SARIF를 공통 schema로 정규화하고, endpoint·데이터 흐름·패치 diff·격리 실행 결과를 연결하여 검토자가 근거를 한곳에서 확인하도록 설계합니다. AI는 중복 그룹화, 근본 원인 가설, 추가 검증과 회귀 테스트를 제안하지만 취약점을 자동 확정하지 않습니다.
+본 저장소의 AI 보조 SAST는 이 시점 이후 시작한 후속 연구입니다. 현재 MVP는 기존 도구의 SARIF를 공통 schema로 정규화하고, 같은 service·sink 위치와 호환 CWE를 기준으로 보수적으로 묶습니다. 각 group에는 스캐너 요약, SARIF에 존재하는 첫 번째 dataflow, 사용자가 명시적으로 허용한 마스킹 source 조각만 연결합니다. AI는 이 증거를 바탕으로 근본 원인 가설과 추가 검증을 제안하지만 취약점을 자동 확정하지 않습니다. endpoint·설정·patch diff·격리 실행 결과를 표준 증거로 가져오는 기능은 후속 과제입니다.
 
 #### 2.4.4 생성 payload 검증
 
-AI 또는 규칙에서 제안된 테스트 입력은 개인 소유의 격리 서버에 배치한 허가된 문제 파일 또는 synthetic 변형에만 적용합니다. 정상 동작을 파괴하지 않는 canary를 사용하고, 패치 전 성공·패치 후 차단·정상 기능 유지 여부를 함께 확인합니다. 이 동적 검증 및 패치 우회 관점에서 44개 항목을 추가 정리하여 전체 연구 후보는 241개가 되었습니다.
+공방전 후 별도 연구에서는 AI 또는 규칙에서 제안된 테스트 입력을 개인 소유의 격리 서버에 배치한 허가된 문제 파일 또는 synthetic 변형에만 적용했습니다. 정상 동작을 파괴하지 않는 canary를 사용하고, 패치 전 성공·패치 후 차단·정상 기능 유지 여부를 함께 확인했습니다. 이 동적 검증 및 패치 우회 관점에서 44개 항목을 추가 정리하여 전체 연구 후보는 241개가 되었습니다. **현재 공개 CLI는 payload 또는 회귀 테스트를 생성하거나 실행하지 않으며, runtime 결과를 evidence bundle로 가져오지도 않습니다.**
 
 ## 3. 데이터셋과 라벨
 
@@ -65,7 +67,7 @@ AI 또는 규칙에서 제안된 테스트 입력은 개인 소유의 격리 서
 | Low | 19 | 7.88% |
 | 합계 | 241 | 100.00% |
 
-각 후보에는 심각도와 별도로 다음 상태 중 하나를 부여합니다.
+전체 연구 데이터셋에서는 각 후보에 심각도와 별도로 다음 목표 상태 중 하나를 부여합니다.
 
 - `candidate`: 분석기가 탐지했으나 아직 검토하지 않은 항목
 - `evidence_supported`: 정적 경로, 설정 또는 patch 근거가 연결된 항목
@@ -73,21 +75,27 @@ AI 또는 규칙에서 제안된 테스트 입력은 개인 소유의 격리 서
 - `reviewed_confirmed`: 사람이 근본 원인과 영향을 검토한 항목
 - `rejected`: 오탐, 중복 또는 비도달 경로로 판정한 항목
 
+이 상태 체계는 연구 라벨링 계획입니다. 현재 공개 MVP의 group 상태는 기본 `candidate`이며, SARIF metadata에 따라 `suppressed_candidate` 또는 `baseline_absent`로 표시될 수 있습니다. 사람 검토 상태는 `pending_review`이고 AI 출력은 상태를 전환하지 않습니다.
+
 실전에서 확인한 사례, 사후 발견 항목, synthetic mutation을 서로 다른 dataset split으로 유지합니다. AI 프롬프트에 정답 label이나 실제 payload를 노출한 자료는 blind discovery 평가에서 제외합니다.
 
 ## 4. 비교 실험
 
-다음 조건을 동일한 held-out fixture에 적용합니다.
+다음 조건을 동일한 held-out fixture에 적용하는 것을 목표로 합니다. 표의 구현 상태는 현재 공개 MVP 기준입니다.
 
-| 조건 | 구성 | 확인 목적 |
-| --- | --- | --- |
-| B0 | Semgrep 기본·사용자 규칙 | 빠른 분석 기준선 |
-| B1 | CodeQL 결과 | 심층 흐름 기준선 |
-| B2 | Semgrep + CodeQL 정규화 | 단순 도구 통합 효과 |
-| B3 | B2 + AI triage | 설명·중복 제거 효과 |
-| B4 | B3 + 패치·격리 증거 | 증거 연결 효과 |
+| 조건 | 구성 | 확인 목적 | MVP 상태 |
+| --- | --- | --- | --- |
+| B0 | Semgrep 기본·사용자 규칙 | 빠른 분석 기준선 | 실행 가능 |
+| B1 | CodeQL 결과 | 심층 흐름 기준선 | 조건부 실행 가능 |
+| B2 | Semgrep + CodeQL 정규화 | 단순 도구 통합 효과 | 실행 가능 |
+| B3 | B2 + AI triage | 설명·중복 제거 효과 | 실행 가능 |
+| B4 | B3 + 패치·격리 증거 | 증거 연결 효과 | 미구현 importer 필요 |
 
-CodeQL을 실행할 수 없는 환경에서는 해당 조건을 `not available`로 표시하고 Semgrep 결과로 대체한 것처럼 작성하지 않습니다. 각 실험은 동일 commit, 규칙 버전, 제한 시간과 자원 조건을 기록합니다.
+CodeQL을 실행할 수 없는 환경에서는 해당 조건을 `not available`로 표시하고 Semgrep 결과로 대체한 것처럼 작성하지 않습니다. 현재 CodeQL 어댑터는 CodeQL CLI 2.16.4 이상의 no-build 경로만 사용하고 저장소 빌드를 실행하지 않으며, 설치 버전을 자동 검증하지 않습니다. 특히 `java-kotlin` no-build 분석은 Java만 포함하고 Kotlin을 지원하지 않으므로, Kotlin 또는 실제 빌드가 필요한 실험은 격리된 외부 CodeQL 단계에서 SARIF를 생성한 뒤 `ingest`해야 합니다. 각 실험은 동일 commit, 분석기·규칙 버전, 제한 시간과 자원 조건을 기록합니다.
+
+SARIF `kind=pass`와 `kind=notApplicable`은 finding에서 제외합니다. accepted suppression은 공개 finding의 `suppressed`, 모든 구성 finding이 accepted인 group은 `suppressed_candidate`로 표시하지만 자동 제외·기각하지 않습니다. 유효한 `baselineState`는 `baseline_state`로 보존하고, suppressed 상태가 우선하지 않으면서 모든 구성 finding이 absent인 group은 `baseline_absent`로 표시하지만 delta를 계산하지 않습니다. 그러므로 baseline 및 suppression 정책은 실험 전에 고정하고, 전처리 여부와 suppressed finding 포함 여부를 결과 표에 명시해야 합니다.
+
+Semgrep은 어댑터가 ignore override를 전달하지 않아 설치 버전의 기본 ignore 동작을 따릅니다. Trivy는 대상 밖의 격리 작업 디렉터리에서 신뢰된 빈 config와 빈 ignorefile을 명시하므로 대상의 `trivy.yaml`·`.trivyignore`를 무시하고 `.git`만 별도로 skip합니다. CLI의 offline 실험에는 대상 밖에 미리 채운 `--trivy-cache-dir`가 필수입니다. scanner 실행 파일도 대상 밖에 설치해야 합니다. scanner가 제외한 파일은 SARIF에 남지 않으므로, 비교 실험에서는 분석기 버전, cache 준비 상태와 최종 스캔 대상 정책을 보존해야 합니다.
 
 ## 5. 평가 지표
 
@@ -104,6 +112,10 @@ CodeQL을 실행할 수 없는 환경에서는 해당 조건을 `not available`�
 
 사람 검토 시간은 최소 두 번 반복하여 학습 효과를 기록합니다. 가능하면 후보 순서를 무작위화하고, 검토자가 어떤 조건의 결과인지 모르게 하여 AI 출력에 대한 기대 편향을 줄입니다.
 
+OpenAI triage를 사용할 때 현재 구현은 root-cause group당 API를 한 번 호출합니다. 기본 상한은 실행당 20개 group이며, `--max-ai-groups`를 넘으면 첫 호출 전에 실패합니다. 호출 수 상한은 token·비용 상한과 같지 않으므로 실험별 모델, source 포함 여부, 실제 input/output token과 제공자 청구액을 별도로 기록하고 계정 측 예산 제한을 사용합니다. AI를 사용하지 않는 baseline에는 이 상한이 적용되지 않습니다.
+
+pipeline 작업량 기본 상한은 finding 5,000개와 group 500개이며, 초과하면 artifact를 쓰기 전에 실패합니다. 비교 실험에서 `--max-findings` 또는 `--max-groups`를 변경했다면 변경값과 메모리·디스크·검토 시간 영향을 함께 기록합니다.
+
 ## 6. 패치 검증 기준
 
 패치는 다음 조건을 모두 만족할 때만 유효한 수정으로 기록합니다.
@@ -118,7 +130,7 @@ CodeQL을 실행할 수 없는 환경에서는 해당 조건을 `not available`�
 
 ## 7. 생성 테스트의 안전 통제
 
-생성 payload는 실행 가능한 공격 문자열이 아니라 먼저 구조화된 test intent로 저장합니다. 예를 들어 “shell metacharacter가 포함된 입력이 프로세스 실행에 도달하지 않아야 한다”는 조건을 생성하고, 실제 입력은 synthetic fixture에 맞춰 제한적으로 구성합니다.
+이 절은 현재 CLI 기능이 아니라 후속 동적 검증 단계의 통제 기준입니다. 생성 payload는 실행 가능한 공격 문자열이 아니라 먼저 구조화된 test intent로 저장합니다. 예를 들어 “shell metacharacter가 포함된 입력이 프로세스 실행에 도달하지 않아야 한다”는 조건을 생성하고, 실제 입력은 synthetic fixture에 맞춰 제한적으로 구성합니다.
 
 - 외부 IP·domain 및 실제 계정 사용 금지
 - DNS·HTTP egress 기본 차단
@@ -140,4 +152,4 @@ CodeQL을 실행할 수 없는 환경에서는 해당 조건을 `not available`�
 
 ## 10. 보고서용 요약 문단
 
-> 공방전 당시에는 Gamebox를 사전에 설치하지 않는 원칙 아래 Semgrep을 중심으로 빠른 코드 패턴 탐색을 수행하였고, CodeQL은 고사양 교실 데스크톱에서 지정 팀원이 보조적으로 실행하였다. 실전 사례는 성공·실패·불확정 상태를 구분해 기록하되, 공개본에서는 서비스별 세부 내용을 제외하였다. 공방전 후에는 배포 호스트 소스와 기존 SAST 결과를 재검토하여 197개 후보를 정리했고, 개인 서버의 격리 환경에서 동적 검증과 패치 우회 관점의 분석을 수행하여 44개 후보를 추가하였다. 총 241개 후보는 Critical 24개, High 89개, Medium 109개, Low 19개로 분류되지만, 이 수치를 모두 독립적인 확정 취약점으로 해석하지 않고 증거 수준과 수동 검토 상태를 별도로 관리하였다. 이러한 사후 분석의 triage 병목을 개선하기 위한 향후 과제로, Semgrep·CodeQL 결과와 패치·실행 증거를 통합하고 AI가 설명과 검증 계획을 보조하는 사용자 정의 SAST 프로토타입을 설계하였다.
+> 공방전 당시에는 Gamebox를 사전에 설치하지 않는 원칙 아래 Semgrep을 중심으로 빠른 코드 패턴 탐색을 수행하였고, CodeQL은 고사양 교실 데스크톱에서 지정 팀원이 보조적으로 실행하였다. 실전 사례는 성공·실패·불확정 상태를 구분해 기록하되, 공개본에서는 서비스별 세부 내용을 제외하였다. 공방전 후에는 배포 호스트 소스와 기존 SAST 결과를 재검토하여 197개 후보를 정리했고, 개인 서버의 격리 환경에서 동적 검증과 패치 우회 관점의 분석을 수행하여 44개 후보를 추가하였다. 총 241개 후보는 Critical 24개, High 89개, Medium 109개, Low 19개로 분류되지만, 이 수치를 모두 독립적인 확정 취약점으로 해석하지 않고 증거 수준과 수동 검토 상태를 별도로 관리하였다. 이러한 사후 분석의 triage 병목을 개선하기 위한 후속 연구로, 현재 공개 MVP는 Semgrep·CodeQL·Trivy SARIF의 정규화, 보수적 root-cause grouping, 제한된 증거 묶음과 선택적 AI 설명을 구현하였다. 패치·설정·실행 증거 통합과 상태 전이는 다음 단계로 남겨 두었다.

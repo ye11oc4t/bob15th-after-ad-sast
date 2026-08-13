@@ -2,7 +2,7 @@
 
 BoB 15기 공방전 이후의 소스 코드 분석을 재현 가능한 연구 절차로 정리하기 위한 **증거 기반 AI 보조 SAST 프로토타입**입니다.
 
-이 저장소의 도구는 공방전 당시 사용한 도구가 아닙니다. 공방전이 끝난 뒤 확보한 분석 경험을 바탕으로, Semgrep·CodeQL 등 기존 정적 분석기의 결과와 사람이 확인한 실행 증거를 함께 정리하는 **후속 연구 및 향후 과제**입니다. AI의 답변만으로 취약점을 확정하거나 패치를 자동 적용하지 않습니다.
+이 저장소의 도구는 공방전 당시 사용한 도구가 아닙니다. 공방전이 끝난 뒤 확보한 분석 경험을 바탕으로 만든 **후속 연구용 MVP**입니다. 현재 구현은 Semgrep·CodeQL·Trivy의 SARIF를 정규화하고, 같은 위치의 후보를 보수적으로 그룹화한 뒤, 스캐너 요약·SARIF 데이터 흐름·선택적 소스 조각을 증거 묶음으로 저장합니다. 설정·패치·동적 실행 증거의 가져오기와 자동 상태 전이는 아직 로드맵입니다. AI의 답변만으로 취약점을 확정하거나 패치를 자동 적용하지 않습니다.
 
 ## 공개 범위와 주의사항
 
@@ -53,7 +53,11 @@ BoB 15기 A&D는 EDU, Fintech, Healthcare, Manufacturer의 네 서비스로 구�
 - `analyze`: 허가된 로컬 경로를 분석하고 결과를 공통 finding 형식으로 정리합니다.
 - `ingest`: Semgrep·CodeQL 등이 만든 SARIF를 읽어 공통 스키마로 정규화합니다.
 
-정적 분석기 결과는 먼저 기계적으로 수집됩니다. AI가 활성화된 경우에도 AI는 코드 위치, rule ID, 데이터 흐름, 패치 diff, 격리 환경의 실행 결과처럼 제공된 증거를 설명하고 우선순위를 제안하는 역할만 합니다. `confirmed` 판정은 반드시 사람이 검토한 증거를 요구합니다.
+정적 분석기 결과는 먼저 기계적으로 수집됩니다. 현재 증거 묶음에는 항상 스캐너·rule·심각도·CWE·sink 요약이 들어가고, SARIF에 데이터 흐름이 있으면 첫 번째 흐름을 추가합니다. `--include-source`를 지정한 경우에만 경로 이탈 검사를 통과하고 마스킹된 관련 소스 조각을 추가합니다. 설정, patch diff, 로그와 동적 실행 결과를 별도 증거로 가져오는 기능은 아직 구현되지 않았습니다.
+
+AI가 활성화된 경우에도 위 증거를 바탕으로 설명과 검증 계획을 제안할 뿐입니다. 현재 AI 호출은 **root-cause group당 1회**이며, 기본 상한은 한 실행당 20개 group입니다. `--max-ai-groups`로 더 낮게 제한할 수 있고, 상한을 넘으면 첫 API 호출 전에 실행을 중단합니다. 이 값은 호출 수 상한이지 token 또는 원화 비용 보장은 아니므로, 제공자 측 예산 제한도 함께 설정해야 합니다. `confirmed` 판정은 반드시 사람이 검토한 증거를 요구합니다.
+
+`demo`와 `analyze`의 pipeline 작업량 기본 상한은 finding 5,000개와 root-cause group 500개입니다. 초과하면 output 디렉터리를 만들거나 artifact를 쓰기 전에 실패합니다. 필요하면 `--max-findings`와 `--max-groups`로 명시적으로 늘릴 수 있지만, 메모리·디스크·검토량을 먼저 산정해야 합니다.
 
 ## 빠른 시작
 
@@ -66,7 +70,7 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-Windows PowerShell에서는 가상환경 활성화 명령으로 `.venv\Scripts\Activate.ps1`을 사용합니다.
+Windows PowerShell에서는 가상환경 활성화 명령으로 `.venv\Scripts\Activate.ps1`을 사용합니다. `doctor`, `demo`, `ingest`는 사용할 수 있지만, 로컬 분석기 프로세스 전체를 안전하게 종료하기 위해 현재 `analyze`는 POSIX 환경에서만 실행됩니다. Windows에서는 외부 격리 환경에서 만든 SARIF를 `ingest`하십시오.
 
 ```bash
 bob15-sast doctor
@@ -76,11 +80,15 @@ bob15-sast ingest fixtures/sarif/sample.sarif
 
 데모와 ingest는 별도 분석기 없이 동작하며 synthetic fixture만 처리합니다. 실제 분석은 Semgrep, CodeQL 또는 Trivy를 사용자가 별도로 설치한 뒤 실행합니다. 예를 들어 Semgrep 설치 후 `bob15-sast analyze fixtures/synthetic`을 실행할 수 있습니다. 실제 소스를 분석하기 전에는 해당 코드에 대한 권한과 실행 격리를 먼저 확인하십시오. 기본 `analyze`는 프로젝트에 포함된 Python 명령 주입 예시 규칙 하나를 사용하는 MVP이며, 범용 취약점 커버리지를 주장하지 않습니다.
 
+scanner 실행 파일은 분석 대상 밖에 설치하십시오. PATH에서 찾은 Semgrep·CodeQL·Trivy 실행 파일이 대상 내부로 resolve되면 실행을 거부하므로, 대상 저장소 안의 가상환경도 scanner 설치 위치로 사용하지 않아야 합니다. `--scanner trivy`에는 대상 밖에 미리 채운 `--trivy-cache-dir`가 필수입니다.
+
 OpenAI triage는 선택 기능입니다. `python -m pip install -e ".[openai]"` 후 `--ai openai`로 활성화할 수 있습니다. 기본적으로 소스 본문은 외부 모델에 보내지 않으며, `--include-source`를 함께 지정할 때만 민감정보 마스킹을 거친 관련 소스 조각이 전송됩니다. 이 옵션을 사용하기 전 제공자의 데이터 처리 조건을 확인하십시오.
+
+`analyze`의 기본 결과 위치는 분석 대상 밖에 매 실행 새로 만드는 비공개 운영체제 임시 디렉터리 `bob15-sast-artifacts-*`입니다. `--output`을 직접 지정하더라도 대상 디렉터리 자체나 그 하위 경로는 거부합니다. 이는 분석 산출물이 다시 스캔되거나 대상 저장소를 오염시키는 일을 막기 위한 경계입니다.
 
 ## 결과 상태
 
-도구의 finding은 심각도와 확정 상태를 분리해 기록하는 것을 원칙으로 합니다.
+아래 상태는 연구 보고서에서 사용할 **목표 상태 모델**입니다. 현재 MVP의 group 상태는 기본 `candidate`이며, 모든 구성 finding에 accepted suppression이 있으면 `suppressed_candidate`, 그렇지 않으면서 모든 구성 finding의 SARIF `baselineState`가 `absent`이면 `baseline_absent`로 표시합니다. 사람 검토 상태는 `pending_review`입니다. 이 표시는 원본 SARIF 상태를 보존하기 위한 것이며 취약점 기각이나 사람 검토 완료를 뜻하지 않습니다. 설정·patch·runtime 증거 가져오기와 나머지 상태 전이는 아직 자동화되지 않았습니다.
 
 | 상태 | 의미 | 전환 권한 |
 | --- | --- | --- |
@@ -90,13 +98,19 @@ OpenAI triage는 선택 기능입니다. `python -m pip install -e ".[openai]"` 
 | `reviewed_confirmed` | 사람이 근본 원인과 영향까지 검토함 | 사람 검토자 |
 | `rejected` | 오탐, 중복 또는 비도달 경로로 판정됨 | 사람 검토자 |
 
-AI는 상태 전환에 필요한 설명이나 검증 계획을 제안할 수 있지만, 스스로 `reviewed_confirmed`를 부여할 수 없습니다.
+AI는 상태 전환에 필요한 설명이나 검증 계획을 제안할 수 있지만, 스스로 `reviewed_confirmed`를 부여할 수 없습니다. 현재 CLI는 AI 제안만으로 어떤 상태도 승격하지 않습니다.
 
 ## CodeQL 관련 주의
 
 CodeQL은 이 저장소에 포함하거나 재배포하지 않습니다. CodeQL의 소스 구성요소와 CLI 배포물은 적용되는 라이선스 및 이용 조건이 서로 다를 수 있으므로, 사용 전 현재의 GitHub CodeQL 약관과 자신의 연구·교육·상업적 사용 범위를 직접 확인해야 합니다. 이 프로젝트에서는 CodeQL이 설치되어 있을 때 생성된 SARIF를 선택적으로 수집하는 어댑터만 가정합니다. CodeQL이 없어도 synthetic 데모와 SARIF ingest는 동작해야 합니다.
 
-안전 경계를 위해 현재 CodeQL 어댑터는 `--build-mode=none`을 지원하는 언어만 허용하며 저장소 제공 빌드 명령을 실행하지 않습니다. 별도 빌드가 필요한 언어는 이 CLI에서 제외하고, 네트워크·파일시스템·권한을 제한한 별도 격리 단계에서 SARIF를 만든 뒤 `ingest`로 가져와야 합니다.
+안전 경계를 위해 현재 CodeQL 어댑터는 CodeQL CLI 2.16.4 이상의 `--build-mode=none` 경로만 사용하며 저장소 제공 빌드 명령을 실행하지 않습니다. 어댑터가 설치 버전을 자동 검증하지 않으므로 사용자가 호환 버전을 확인해야 합니다. 특히 `--codeql-language java-kotlin`에서 no-build 추출은 **Java만 대상으로 하며 Kotlin은 분석하지 않습니다**. Kotlin 또는 실제 빌드가 필요한 프로젝트는 네트워크·파일시스템·권한을 제한한 외부 격리 단계에서 CodeQL 데이터베이스와 SARIF를 만든 뒤, 이 도구의 `ingest`로 가져와야 합니다.
+
+## SARIF suppression과 baseline
+
+현재 parser는 SARIF `kind`가 `pass` 또는 `notApplicable`인 결과를 건너뜁니다. suppression이 있는 finding은 삭제하지 않습니다. 공개 정규화 JSON의 `suppressed`는 suppression 중 `status=accepted`가 하나라도 있을 때만 `true`이고, `baseline_state`는 허용된 SARIF `baselineState`를 노출합니다. group의 `suppressed_candidate`와 `baseline_absent`도 이 metadata를 보존하는 보조 상태일 뿐 자동 기각이나 baseline delta 계산이 아닙니다. 따라서 baseline 비교가 필요하면 입력 SARIF를 별도로 관리하고 사람의 검토 정책에 따라 처리해야 합니다.
+
+스캔 단계의 파일 제외 정책도 이 parser 동작과 별개입니다. Semgrep 어댑터는 ignore 동작을 덮어쓰지 않으므로 설치 버전이 인식하는 대상 저장소의 ignore 정책을 따릅니다. Trivy는 대상 밖의 격리된 작업 디렉터리에서 신뢰된 빈 `trivy.yaml`과 빈 ignorefile을 명시적으로 사용하므로 대상의 `trivy.yaml`·`.trivyignore`가 분석을 바꾸거나 finding을 숨기지 못하며, `.git`은 명시적으로 건너뜁니다. CLI의 Trivy offline scan에는 대상 밖에 미리 채운 `--trivy-cache-dir`가 필수입니다. 재현 실험에서는 분석기 버전, cache 준비 상태와 최종 스캔 파일 목록을 별도로 기록해야 합니다.
 
 ## 저장소 구성
 

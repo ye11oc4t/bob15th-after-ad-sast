@@ -144,6 +144,58 @@ class FindingGroupingTests(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         self.assertEqual(len({group.fingerprint for group in groups}), len(groups))
 
+    def test_group_signature_delimiters_cannot_collide(self) -> None:
+        findings = [
+            _finding(tool="X", rule="a", cwes=["CWE-20"]),
+            _finding(tool="Y", rule="b,y:c", cwes=["CWE-20"]),
+            _finding(tool="X", rule="a,y:b", cwes=["CWE-20"]),
+            _finding(tool="Y", rule="c", cwes=["CWE-20"]),
+        ]
+        groups = group_findings(findings)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len({group.fingerprint for group in groups}), 2)
+
+    def test_locationless_nul_delimiters_cannot_merge(self) -> None:
+        findings = [
+            Finding(
+                service="demo",
+                tool="a",
+                rule_id="b\0c",
+                message="same",
+            ),
+            Finding(
+                service="demo",
+                tool="a\0b",
+                rule_id="c",
+                message="same",
+            ),
+        ]
+        groups = group_findings(findings)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len({group.fingerprint for group in groups}), 2)
+
+    def test_external_paths_are_not_treated_as_one_concrete_sink(self) -> None:
+        findings = [
+            _finding(tool="Semgrep", rule="one", cwes=["CWE-78"], path="<external-path>"),
+            _finding(tool="CodeQL", rule="two", cwes=["CWE-78"], path="<external-path>"),
+        ]
+        groups = group_findings(findings)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len({group.fingerprint for group in groups}), 2)
+
+    def test_long_identity_material_remains_distinct(self) -> None:
+        prefix = "x" * 3_000
+        first = Finding(
+            service="demo",
+            tool="scanner",
+            rule_id="rule",
+            message=prefix + "-one",
+        )
+        second = first.model_copy(update={"message": prefix + "-two"})
+        groups = group_findings([first, second])
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(len({group.fingerprint for group in groups}), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,8 +19,13 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, value: Any) -> None:
     """Atomically write stable, human-readable JSON."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    parent = parent.resolve()
+    destination = parent / path.name
+    if destination.exists() and destination.is_symlink():
+        raise ValueError(f"refusing to replace symlink output: {destination}")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -28,8 +33,7 @@ def write_json(path: Path, value: Any) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        temporary.replace(path)
+        temporary.replace(destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-

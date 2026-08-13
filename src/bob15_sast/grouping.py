@@ -3,15 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections import defaultdict
 from collections.abc import Iterable
 
 from .models import Finding, FindingGroup, Severity, root_cause_fingerprint
 
+_NON_CONCRETE_PATHS = {"<unknown>", "<unsafe-path>", "<external-path>"}
+_MAX_IDENTITY_CHARS = 2_000
+
+
+def _identity_text(value: str) -> str:
+    """Bound attacker-controlled fingerprint material without losing identity."""
+
+    if len(value) <= _MAX_IDENTITY_CHARS:
+        return value
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    return f"{value[:_MAX_IDENTITY_CHARS]}#sha256:{digest}"
+
 
 def _location_key(finding: Finding) -> tuple[str, str, int] | None:
     sink = finding.sink
-    if sink is None or sink.path in {"<unknown>", "<unsafe-path>"}:
+    if sink is None or sink.path in _NON_CONCRETE_PATHS:
         return None
     return finding.service.strip().casefold(), sink.path, sink.line
 
@@ -48,16 +61,15 @@ def _finding_sort_key(finding: Finding) -> tuple[str, str, int, str, str, str]:
 def _standalone_fingerprint(finding: Finding) -> str:
     """Create a unique stable ID when location/CWE grouping is unsafe."""
 
-    material = "\0".join(
-        (
-            finding.fingerprint or "",
-            finding.service.casefold(),
-            finding.tool.casefold(),
-            finding.rule_id,
-            finding.message,
-        )
-    )
-    return "sha256:" + hashlib.sha256(material.encode()).hexdigest()
+    material = [
+        finding.fingerprint or "",
+        _identity_text(finding.service.casefold()),
+        _identity_text(finding.tool.casefold()),
+        _identity_text(finding.rule_id),
+        _identity_text(finding.message),
+    ]
+    encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _group_fingerprint(
@@ -80,7 +92,11 @@ def _group_fingerprint(
     tools = {finding.tool.casefold() for finding in grouped_findings}
     if len(tools) > 1:
         return base
-    rules = ",".join(sorted({finding.rule_id for finding in grouped_findings}))
+    rules = json.dumps(
+        sorted({_identity_text(finding.rule_id) for finding in grouped_findings}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     return "sha256:" + hashlib.sha256(f"{base}\0{rules}".encode()).hexdigest()
 
 
@@ -123,11 +139,20 @@ def _disambiguate_colliding_fingerprints(groups: list[FindingGroup]) -> None:
         if len(members) < 2:
             continue
         for group in members:
-            signature = ",".join(
-                sorted(f"{item.tool.casefold()}:{item.rule_id}" for item in group.findings)
+            signature = json.dumps(
+                sorted(
+                    [_identity_text(item.tool.casefold()), _identity_text(item.rule_id)]
+                    for item in group.findings
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
             group.fingerprint = "sha256:" + hashlib.sha256(
-                f"{fingerprint}\0{signature}".encode()
+                json.dumps(
+                    [fingerprint, signature],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
             ).hexdigest()
 
 

@@ -276,6 +276,7 @@ def run_command(
     cwd: str | os.PathLike[str] | None = None,
     environment: Mapping[str, str] | None = None,
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    forbidden_executable_roots: Iterable[str | os.PathLike[str]] = (),
 ) -> CommandResult:
     """Run one scanner command under the constrained execution policy."""
 
@@ -289,6 +290,13 @@ def run_command(
     executable = _resolve_executable(
         original_argv[0], allowed_executables, child_environment
     )
+    executable_path = Path(executable)
+    for raw_root in forbidden_executable_roots:
+        root = Path(raw_root).expanduser().resolve()
+        if executable_path == root or executable_path.is_relative_to(root):
+            raise UnsafeCommandError(
+                f"scanner executable resolves inside an untrusted tree: {executable_path}"
+            )
     execution_argv = (executable, *original_argv[1:])
 
     working_directory: str | None = None
@@ -396,6 +404,7 @@ class SafeCommandRunner:
         cwd: str | os.PathLike[str] | None = None,
         environment: Mapping[str, str] | None = None,
         max_output_bytes: int | None = None,
+        forbidden_executable_roots: Iterable[str | os.PathLike[str]] = (),
     ) -> CommandResult:
         return run_command(
             argv,
@@ -410,4 +419,5 @@ class SafeCommandRunner:
                 if max_output_bytes is None
                 else max_output_bytes
             ),
+            forbidden_executable_roots=forbidden_executable_roots,
         )

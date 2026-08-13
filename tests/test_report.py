@@ -58,3 +58,49 @@ def test_report_escapes_untrusted_markdown() -> None:
     assert "![remote]" not in report
     assert "<img" not in report
     assert "`break`" not in report
+
+
+def test_report_flattens_carriage_returns_and_controls() -> None:
+    finding = Finding(
+        service="safe\r![remote](https://example.invalid/track)\x1b]8;;bad",
+        tool="scanner",
+        rule_id="rule",
+        locations=[Location(path="app.py", line=1)],
+    )
+    group = FindingGroup(
+        fingerprint=finding.fingerprint or "missing",
+        service=finding.service,
+        sink=finding.sink,
+        tools=[finding.tool],
+        findings=[finding],
+    )
+    report = render_markdown(run_id="safe", groups=[group])
+    assert "\r" not in report
+    assert "\x1b" not in report
+    assert "\n![remote]" not in report
+
+
+def test_report_bounds_long_shared_descriptors() -> None:
+    long_tool = "tool-" + "x" * 20_000
+    long_rule = "rule-" + "y" * 20_000
+    finding = Finding(
+        service="service-" + "s" * 20_000,
+        tool=long_tool,
+        rule_id=long_rule,
+        cwes=["CWE-78"],
+        locations=[Location(path="app.py", line=1)],
+    )
+    group = FindingGroup(
+        fingerprint=finding.fingerprint or "missing",
+        service=finding.service,
+        cwes=finding.cwes,
+        sink=finding.sink,
+        tools=[long_tool] * 32,
+        findings=[finding],
+    )
+
+    report = render_markdown(run_id="bounded", groups=[group])
+
+    assert len(report) < 15_000
+    assert long_tool not in report
+    assert long_rule not in report

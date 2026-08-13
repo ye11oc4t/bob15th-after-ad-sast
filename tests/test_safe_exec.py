@@ -130,3 +130,12 @@ def test_trivy_does_not_scan_secrets_by_default() -> None:
 def test_relative_executable_paths_are_rejected() -> None:
     with pytest.raises(UnsafeCommandError, match="relative executable"):
         run_command(["bin/semgrep", "--version"])
+
+
+def test_rejects_scanner_executable_inside_untrusted_tree() -> None:
+    with pytest.raises(UnsafeCommandError, match="inside an untrusted tree"):
+        run_command(
+            [PYTHON, "--version"],
+            allowed_executables=(PYTHON,),
+            forbidden_executable_roots=(Path(PYTHON).parent,),
+        )

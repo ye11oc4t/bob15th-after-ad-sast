@@ -19,6 +19,20 @@ from .report import render_markdown
 from .sarif import load_sarif
 
 _SAFE_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_NON_SOURCE_PATHS = {"<unknown>", "<unsafe-path>", "<external-path>"}
+DEFAULT_MAX_AI_GROUPS = 20
+DEFAULT_MAX_FINDINGS = 5_000
+DEFAULT_MAX_GROUPS = 500
+
+_MAX_FINGERPRINT_CHARS = 200
+_MAX_SERVICE_CHARS = 500
+_MAX_TOOL_CHARS = 500
+_MAX_RULE_ID_CHARS = 1_000
+_MAX_CWE_CHARS = 32
+_MAX_GROUP_TOOLS = 32
+_MAX_GROUP_RULE_IDS = 128
+_MAX_GROUP_CWES = 128
+_MAX_PUBLIC_LOCATIONS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +59,47 @@ def _validate_run_id(run_id: str) -> str:
             "letters, numbers, dot, underscore, or dash"
         )
     return run_id
+
+
+def _bounded_text(value: object, max_chars: int) -> str:
+    """Redact a scalar before bounding its public representation."""
+
+    return redact_text(str(value)[: max_chars * 4])[:max_chars]
+
+
+def _bounded_values(
+    values: Sequence[object],
+    *,
+    max_items: int,
+    max_chars: int,
+) -> list[str]:
+    return [_bounded_text(value, max_chars) for value in values[:max_items]]
+
+
+def _bounded_join(
+    values: Sequence[object],
+    *,
+    max_chars: int,
+    max_items: int,
+    item_chars: int,
+) -> str:
+    """Join untrusted descriptors without first constructing an unbounded scalar."""
+
+    parts: list[str] = []
+    used = 0
+    for value in values[:max_items]:
+        separator = ", " if parts else ""
+        remaining = max_chars - used - len(separator)
+        if remaining <= 0:
+            break
+        part = _bounded_text(value, min(item_chars, remaining))
+        if not part:
+            continue
+        if separator:
+            parts.append(separator)
+        parts.append(part)
+        used += len(separator) + len(part)
+    return "".join(parts)
 
 
 def load_findings(
@@ -74,16 +129,33 @@ def load_findings(
 
 def _group_payload(group: FindingGroup) -> dict[str, Any]:
     location = _public_location(group.sink)
+    status = "candidate"
+    if group.findings and all(_is_suppressed(item) for item in group.findings):
+        status = "suppressed_candidate"
+    elif group.findings and all(_baseline_state(item) == "absent" for item in group.findings):
+        status = "baseline_absent"
     return {
-        "id": group.fingerprint,
-        "fingerprint": group.fingerprint,
-        "service": redact_text(group.service),
-        "tools": [redact_text(tool) for tool in group.tools],
-        "rule_ids": [redact_text(rule_id) for rule_id in group.rule_ids],
+        "id": _bounded_text(group.fingerprint, _MAX_FINGERPRINT_CHARS),
+        "fingerprint": _bounded_text(group.fingerprint, _MAX_FINGERPRINT_CHARS),
+        "service": _bounded_text(group.service, _MAX_SERVICE_CHARS),
+        "tools": _bounded_values(
+            group.tools,
+            max_items=_MAX_GROUP_TOOLS,
+            max_chars=_MAX_TOOL_CHARS,
+        ),
+        "rule_ids": _bounded_values(
+            group.rule_ids,
+            max_items=_MAX_GROUP_RULE_IDS,
+            max_chars=_MAX_RULE_ID_CHARS,
+        ),
         "severity": group.severity.value,
-        "cwes": group.cwes,
+        "cwes": _bounded_values(
+            group.cwes,
+            max_items=_MAX_GROUP_CWES,
+            max_chars=_MAX_CWE_CHARS,
+        ),
         "location": location,
-        "status": "candidate",
+        "status": status,
         "requires_human_confirmation": True,
         "findings": [public_finding(finding) for finding in group.findings],
     }
@@ -93,7 +165,7 @@ def _public_location(location: Any) -> dict[str, Any] | None:
     if location is None:
         return None
     return {
-        "path": redact_text(location.path),
+        "path": redact_text(location.path)[:2_000],
         "line": location.line,
         "column": location.column,
         "end_line": location.end_line,
@@ -101,19 +173,35 @@ def _public_location(location: Any) -> dict[str, Any] | None:
     }
 
 
+def _is_suppressed(finding: Finding) -> bool:
+    return finding.properties.get("sarif_has_accepted_suppression") is True
+
+
+def _baseline_state(finding: Finding) -> str | None:
+    value = finding.properties.get("sarif_baseline_state")
+    normalized = str(value).casefold() if value is not None else None
+    return normalized if normalized in {"new", "unchanged", "updated", "absent"} else None
+
+
 def public_finding(finding: Finding) -> dict[str, Any]:
     """Serialize only fields needed for review; omit raw SARIF snippets/properties."""
 
     return {
-        "fingerprint": finding.fingerprint,
-        "service": redact_text(finding.service),
-        "tool": redact_text(finding.tool),
-        "rule_id": redact_text(finding.rule_id),
+        "fingerprint": _bounded_text(finding.fingerprint or "unknown", _MAX_FINGERPRINT_CHARS),
+        "service": _bounded_text(finding.service, _MAX_SERVICE_CHARS),
+        "tool": _bounded_text(finding.tool, _MAX_TOOL_CHARS),
+        "rule_id": _bounded_text(finding.rule_id, _MAX_RULE_ID_CHARS),
         "severity": finding.severity.value,
-        "cwes": finding.cwes,
+        "cwes": _bounded_values(
+            finding.cwes,
+            max_items=_MAX_GROUP_CWES,
+            max_chars=_MAX_CWE_CHARS,
+        ),
+        "suppressed": _is_suppressed(finding),
+        "baseline_state": _baseline_state(finding),
         "locations": [
             location
-            for item in finding.locations
+            for item in finding.locations[:_MAX_PUBLIC_LOCATIONS]
             if (location := _public_location(item)) is not None
         ],
         "code_flows": [
@@ -122,7 +210,7 @@ def public_finding(finding: Finding) -> dict[str, Any]:
                     {
                         "location": _public_location(step.location),
                         "execution_order": step.execution_order,
-                        "kinds": step.kinds[:10],
+                        "kinds": [redact_text(str(kind))[:200] for kind in step.kinds[:10]],
                     }
                     for step in flow.steps[:20]
                 ]
@@ -134,20 +222,41 @@ def public_finding(finding: Finding) -> dict[str, Any]:
 
 def _scanner_evidence(group: FindingGroup) -> EvidenceReference:
     location = group.sink
-    where = (
+    where = redact_text(
         f"{location.path}:{location.line}" if location is not None else "<unknown>:0"
-    )
+    )[:2_000]
     content = redact_text(
         "\n".join(
             (
-                f"Tools: {', '.join(group.tools)}",
-                f"Rules: {', '.join(group.rule_ids)}",
+                "Tools: "
+                + _bounded_join(
+                    group.tools,
+                    max_chars=2_000,
+                    max_items=_MAX_GROUP_TOOLS,
+                    item_chars=_MAX_TOOL_CHARS,
+                ),
+                "Rules: "
+                + _bounded_join(
+                    group.rule_ids,
+                    max_chars=4_000,
+                    max_items=_MAX_GROUP_RULE_IDS,
+                    item_chars=_MAX_RULE_ID_CHARS,
+                ),
                 f"Severity: {group.severity.value}",
-                f"CWE: {', '.join(group.cwes) or 'unknown'}",
+                "CWE: "
+                + (
+                    _bounded_join(
+                        group.cwes,
+                        max_chars=1_000,
+                        max_items=_MAX_GROUP_CWES,
+                        item_chars=_MAX_CWE_CHARS,
+                    )
+                    or "unknown"
+                ),
                 f"Sink: {where}",
             )
         )
-    )
+    )[:24_000]
     return EvidenceReference(
         evidence_id=evidence_id("scanner", content),
         kind="scanner",
@@ -172,9 +281,9 @@ def _dataflow_evidence(group: FindingGroup) -> EvidenceReference | None:
                 evidence_id=evidence_id("dataflow", content),
                 kind="dataflow",
                 content=content,
-                location=(
-                    f"{selected[-1].location.path}:{selected[-1].location.line}"
-                ),
+                location=redact_text(f"{selected[-1].location.path}:{selected[-1].location.line}")[
+                    :2_000
+                ],
             )
     return None
 
@@ -183,7 +292,7 @@ def _source_evidence(
     group: FindingGroup,
     source_root: Path | None,
 ) -> EvidenceReference | None:
-    if source_root is None or group.sink is None:
+    if source_root is None or group.sink is None or group.sink.path in _NON_SOURCE_PATHS:
         return None
     try:
         excerpt, first, last = source_excerpt(
@@ -193,8 +302,10 @@ def _source_evidence(
         )
     except (OSError, ValueError):
         return None
-    location = f"{group.sink.path}:{first}-{last}"
+    location = redact_text(f"{group.sink.path}:{first}-{last}")[:2_000]
     content = excerpt[:24_000]
+    if not content.strip():
+        return None
     return EvidenceReference(
         evidence_id=evidence_id("source", f"{location}\0{content}"),
         kind="source",
@@ -223,16 +334,36 @@ def build_triage_request(
         "excluded from remote triage."
     )
     return TriageRequest(
-        finding_id=group.fingerprint,
-        scanner=", ".join(group.tools)[:100] or "unknown",
-        rule_id=", ".join(group.rule_ids)[:300] or "unknown-rule",
+        finding_id=_bounded_text(group.fingerprint, _MAX_FINGERPRINT_CHARS),
+        scanner=(
+            _bounded_join(
+                group.tools,
+                max_chars=100,
+                max_items=_MAX_GROUP_TOOLS,
+                item_chars=_MAX_TOOL_CHARS,
+            )
+            or "unknown"
+        ),
+        rule_id=(
+            _bounded_join(
+                group.rule_ids,
+                max_chars=300,
+                max_items=_MAX_GROUP_RULE_IDS,
+                item_chars=_MAX_RULE_ID_CHARS,
+            )
+            or "unknown-rule"
+        ),
         message=message,
         reported_severity=group.severity.value,
         evidence=evidence,
         metadata=redact(
             {
-                "service": group.service,
-                "cwes": group.cwes,
+                "service": _bounded_text(group.service, _MAX_SERVICE_CHARS),
+                "cwes": _bounded_values(
+                    group.cwes,
+                    max_items=_MAX_GROUP_CWES,
+                    max_chars=_MAX_CWE_CHARS,
+                ),
                 "cross_tool": group.is_cross_tool,
                 "raw_finding_count": group.count,
             }
@@ -259,6 +390,9 @@ def run_pipeline(
     repo_root: Path | None = None,
     provider: TriageProvider | None = None,
     include_source_evidence: bool = False,
+    max_ai_groups: int = DEFAULT_MAX_AI_GROUPS,
+    max_findings: int = DEFAULT_MAX_FINDINGS,
+    max_groups: int = DEFAULT_MAX_GROUPS,
     run_id: str | None = None,
     generated_at: datetime | None = None,
 ) -> PipelineResult:
@@ -266,16 +400,41 @@ def run_pipeline(
 
     if not service.strip():
         raise ValueError("service must not be blank")
+    if max_ai_groups < 0:
+        raise ValueError("max_ai_groups must be zero or greater")
+    if max_findings < 0:
+        raise ValueError("max_findings must be zero or greater")
+    if max_groups < 0:
+        raise ValueError("max_groups must be zero or greater")
+    resolved_output_root = output_root.expanduser().resolve()
+    if source_root is not None:
+        resolved_source_root = source_root.expanduser().resolve()
+        if resolved_output_root == resolved_source_root or resolved_output_root.is_relative_to(
+            resolved_source_root
+        ):
+            raise ValueError("output_root must be outside the untrusted source tree")
     selected_run_id = _validate_run_id(run_id or _new_run_id(generated_at))
-    run_directory = output_root.expanduser().resolve() / selected_run_id
+    findings = load_findings(sarif_paths, service=service, repo_root=repo_root)
+    if len(findings) > max_findings:
+        raise ValueError(
+            f"pipeline loaded {len(findings)} findings, exceeding max_findings={max_findings}"
+        )
+    groups = group_findings(findings)
+    if len(groups) > max_groups:
+        raise ValueError(
+            f"pipeline produced {len(groups)} groups, exceeding max_groups={max_groups}"
+        )
+    if provider is not None and len(groups) > max_ai_groups:
+        raise ValueError(
+            f"AI triage requires {len(groups)} calls, exceeding max_ai_groups="
+            f"{max_ai_groups}; increase the limit explicitly after reviewing cost"
+        )
+    run_directory = resolved_output_root / selected_run_id
     run_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
     try:
         run_directory.chmod(0o700)
     except OSError:  # pragma: no cover - permissions differ on Windows
         pass
-
-    findings = load_findings(sarif_paths, service=service, repo_root=repo_root)
-    groups = group_findings(findings)
     write_json(
         run_directory / "normalized-findings.json",
         [public_finding(finding) for finding in findings],
@@ -319,9 +478,7 @@ def run_pipeline(
             run_id=selected_run_id,
             groups=groups,
             assessments={
-                fingerprint: _report_assessment(
-                    TriageAssessment.model_validate(assessment)
-                )
+                fingerprint: _report_assessment(TriageAssessment.model_validate(assessment))
                 for fingerprint, assessment in assessments.items()
             },
             generated_at=generated_at,
@@ -336,11 +493,17 @@ def run_pipeline(
         run_directory / "run.json",
         {
             "run_id": selected_run_id,
-            "service": redact_text(service),
+            "service": _bounded_text(service, _MAX_SERVICE_CHARS),
             "inputs": [redact_text(path.name) for path in sarif_paths],
             "finding_count": len(findings),
             "root_cause_group_count": len(groups),
             "assessment_count": len(assessments),
+            "max_ai_groups": max_ai_groups,
+            "limits": {
+                "max_findings": max_findings,
+                "max_groups": max_groups,
+                "max_ai_groups": max_ai_groups,
+            },
             "triage_provider": type(provider).__name__ if provider else "disabled",
             "human_review_status": "pending_review",
         },

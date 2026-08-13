@@ -7,6 +7,7 @@ requiring a real build must be handled in a separately sandboxed build stage.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -39,6 +40,26 @@ _QUERY_PACK_LANGUAGES = {
     "python": "python",
     "ruby": "ruby",
 }
+
+
+def _contains_kotlin_source(target: Path) -> bool:
+    """Return whether a file or tree contains Kotlin source.
+
+    CodeQL's no-build extraction is intentionally used by this adapter so
+    repository-controlled build scripts are never executed.  That mode does
+    not extract Kotlin, so silently analyzing only the Java portion would
+    produce a dangerously incomplete result.
+    """
+
+    if target.is_file():
+        return target.suffix.casefold() in {".kt", ".kts"}
+    for _root, _directories, filenames in os.walk(target, followlinks=False):
+        if any(
+            filename.casefold().endswith((".kt", ".kts"))
+            for filename in filenames
+        ):
+            return True
+    return False
 
 
 class CodeQLAdapter(ScannerAdapter):
@@ -75,6 +96,12 @@ class CodeQLAdapter(ScannerAdapter):
 
     def scan(self, target: Path, output_path: Path) -> ScanExecution:
         target, output_path = prepare_scan_paths(target, output_path)
+        if self.language == "java-kotlin" and _contains_kotlin_source(target):
+            raise ValueError(
+                "CodeQL --build-mode=none is Java-only and does not extract Kotlin; "
+                "the target contains .kt or .kts source files. Analyze it in a separately "
+                "sandboxed build stage instead."
+            )
         if self.database_path == target or target in self.database_path.parents:
             raise ValueError("the CodeQL database must be outside the target tree")
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +120,9 @@ class CodeQLAdapter(ScannerAdapter):
             create_argv.append("--overwrite")
 
         create_result = self.runner.run(
-            create_argv, timeout_seconds=self.timeout_seconds
+            create_argv,
+            timeout_seconds=self.timeout_seconds,
+            forbidden_executable_roots=(target,),
         )
         if not create_result.succeeded:
             return ScanExecution(self.name, output_path, (create_result,))
@@ -109,7 +138,9 @@ class CodeQLAdapter(ScannerAdapter):
             "--threads=0",
         ]
         analyze_result = self.runner.run(
-            analyze_argv, timeout_seconds=self.timeout_seconds
+            analyze_argv,
+            timeout_seconds=self.timeout_seconds,
+            forbidden_executable_roots=(target,),
         )
         return ScanExecution(
             self.name, output_path, (create_result, analyze_result)

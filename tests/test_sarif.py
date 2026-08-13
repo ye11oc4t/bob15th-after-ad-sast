@@ -290,6 +290,38 @@ class SarifNormalizationTests(unittest.TestCase):
         finding = normalize_sarif(document, "sample-service")[0]
         self.assertEqual(finding.sink.path, "<unsafe-path>")
 
+    def test_unrelated_absolute_path_is_redacted_as_external(self) -> None:
+        for uri in (
+            "file:///home/example/private/source.py",
+            "/var/lib/build/source.py",
+            r"C:\Users\example\private\source.py",
+        ):
+            with self.subTest(uri=uri):
+                self.assertEqual(
+                    normalize_artifact_path(uri, service="sample-service"),
+                    "<external-path>",
+                )
+
+        document = _document_with_result(
+            {
+                "ruleId": "synthetic.rule",
+                "locations": [_physical("file:///home/example/private/source.py", 2)],
+            }
+        )
+        finding = normalize_sarif(document, "sample-service")[0]
+        self.assertEqual(finding.sink.path, "<external-path>")
+        self.assertEqual(finding.sink.original_uri, "<external-path>")
+        self.assertNotIn("example", finding.model_dump_json())
+
+        self.assertEqual(
+            normalize_artifact_path(
+                "/workspace/project/src/sample.py",
+                service="sample-service",
+                repo_root="/workspace/project",
+            ),
+            "src/sample.py",
+        )
+
     def test_malformed_coordinates_are_local_and_kinds_string_is_atomic(self) -> None:
         location = _physical("src/sample.py", 3)
         region = location["physicalLocation"]["region"]
@@ -332,6 +364,70 @@ class SarifNormalizationTests(unittest.TestCase):
         self.assertIsNone(step.nesting_level)
         self.assertEqual(step.kinds, ["sink"])
 
+    def test_locations_without_physical_artifact_identity_are_skipped(self) -> None:
+        result = {
+            "ruleId": "synthetic.rule",
+            "locations": [
+                {"logicalLocations": [{"name": "only-logical"}]},
+                {"physicalLocation": {"region": {"startLine": 2}}},
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"index": 99},
+                        "region": {"startLine": 3},
+                    }
+                },
+                _physical("src/retained.py", 4),
+            ],
+            "codeFlows": [
+                {
+                    "threadFlows": [
+                        {
+                            "locations": [
+                                {"location": {"logicalLocations": [{"name": "x"}]}},
+                                {"location": _physical("src/retained.py", 4)},
+                            ]
+                        }
+                    ]
+                }
+            ],
+        }
+
+        finding = normalize_sarif(_document_with_result(result), "sample-service")[0]
+
+        self.assertEqual([item.path for item in finding.locations], ["src/retained.py"])
+        self.assertEqual(len(finding.code_flows[0].steps), 1)
+        self.assertEqual(finding.code_flows[0].steps[0].location.path, "src/retained.py")
+
+    def test_default_total_trace_step_cap_rejects_before_location_parsing(self) -> None:
+        shared_step = {"location": _physical("src/sample.py", 1)}
+        result = {
+            "ruleId": "synthetic.rule",
+            "codeFlows": [
+                {"threadFlows": [{"locations": [shared_step] * 10_001}]}
+            ],
+        }
+
+        with (
+            patch("bob15_sast.sarif._parse_location") as parse_location,
+            self.assertRaisesRegex(SarifParseError, r"trace steps limit \(10000\)"),
+        ):
+            normalize_sarif(_document_with_result(result), "sample-service")
+        parse_location.assert_not_called()
+
+    def test_total_result_location_cap_is_parse_wide(self) -> None:
+        shared = _physical("src/sample.py", 1)
+        document = _document_with_result(
+            {"ruleId": "synthetic.rule", "locations": [shared, shared]}
+        )
+        document["runs"][0]["results"].append(
+            {"ruleId": "synthetic.rule", "locations": [shared, shared]}
+        )
+        with (
+            patch("bob15_sast.sarif.MAX_RESULT_LOCATIONS", 3),
+            self.assertRaisesRegex(SarifParseError, "result locations limit"),
+        ):
+            normalize_sarif(document, "sample-service")
+
     def test_resource_limits_raise_clear_parse_errors(self) -> None:
         basic = {"ruleId": "synthetic.rule"}
         with (
@@ -367,23 +463,78 @@ class SarifNormalizationTests(unittest.TestCase):
         ):
             load_sarif(io.StringIO('{"runs": []}'), service="sample-service")
 
-    def test_non_finding_results_are_skipped_and_suppressions_are_preserved(self) -> None:
+    def test_rule_metadata_is_cached_and_metadata_work_is_parse_wide(self) -> None:
+        rule = {
+            "id": "synthetic.shared",
+            "properties": {"tags": [f"neutral-{index}" for index in range(20)]},
+            "shortDescription": {"text": "Synthetic CWE-79 rule"},
+        }
+        document = {
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {"driver": {"name": "Synthetic Scanner", "rules": [rule]}},
+                    "results": [
+                        {"ruleId": "synthetic.shared"} for _ in range(100)
+                    ],
+                }
+            ],
+        }
+        # This budget admits one descriptor walk plus result-local metadata, but
+        # would reject walking the shared descriptor for every result.
+        with patch("bob15_sast.sarif.MAX_METADATA_NODES", 300):
+            findings = normalize_sarif(document, "sample-service")
+        self.assertEqual(len(findings), 100)
+        self.assertTrue(all(finding.cwes == ["CWE-79"] for finding in findings))
+
+        expensive_results = _document_with_result(
+            {
+                "ruleId": "synthetic.local",
+                "properties": {"items": ["one", "two", "three", "four"]},
+            }
+        )
+        expensive_results["runs"][0]["results"].append(
+            {
+                "ruleId": "synthetic.local",
+                "properties": {"items": ["five", "six", "seven", "eight"]},
+            }
+        )
+        with (
+            patch("bob15_sast.sarif.MAX_METADATA_NODES", 15),
+            self.assertRaisesRegex(SarifParseError, "metadata nodes limit"),
+        ):
+            normalize_sarif(expensive_results, "sample-service")
+
+    def test_non_finding_results_and_lifecycle_state_are_exposed(self) -> None:
         skipped = {"ruleId": "synthetic.pass", "kind": "pass"}
         retained = {
             "ruleId": "synthetic.review",
             "kind": "review",
-            "suppressions": [{"kind": "inSource"}],
+            "baselineState": "new",
+            "suppressions": [{"kind": "inSource", "status": "accepted"}],
+        }
+        absent = {
+            "ruleId": "synthetic.absent",
+            "baselineState": "absent",
+            "suppressions": [{"kind": "external", "status": "underReview"}],
         }
         document = _document_with_result(skipped)
         document["runs"][0]["results"].append(retained)
+        document["runs"][0]["results"].append(absent)
 
         findings = normalize_sarif(document, "sample-service")
 
-        self.assertEqual(len(findings), 1)
+        self.assertEqual(len(findings), 2)
         self.assertEqual(
             findings[0].properties["sarif_suppressions"],
-            [{"kind": "inSource"}],
+            [{"kind": "inSource", "status": "accepted"}],
         )
+        self.assertTrue(findings[0].properties["sarif_has_accepted_suppression"])
+        self.assertEqual(findings[0].properties["sarif_baseline_state"], "new")
+        self.assertFalse(findings[0].properties["sarif_is_active"])
+        self.assertFalse(findings[1].properties["sarif_has_accepted_suppression"])
+        self.assertEqual(findings[1].properties["sarif_baseline_state"], "absent")
+        self.assertFalse(findings[1].properties["sarif_is_active"])
 
 
 if __name__ == "__main__":

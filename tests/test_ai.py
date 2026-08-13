@@ -59,6 +59,18 @@ def test_assessment_requires_evidence_ids() -> None:
         make_assessment(evidence_ids=[])
 
 
+def test_evidence_ids_reject_markdown_and_control_characters() -> None:
+    with pytest.raises(ValidationError, match="safe single-line"):
+        EvidenceReference(
+            evidence_id="EV-X\n![remote](https://example.invalid)",
+            kind="source",
+            content="safe",
+            location="app.py:1",
+        )
+    with pytest.raises(ValidationError, match="safe identifiers"):
+        make_assessment(evidence_ids=["EV-X\nheading"])
+
+
 def test_assessment_cannot_claim_confirmation() -> None:
     with pytest.raises(ValidationError, match="may not claim"):
         make_assessment(summary="This issue is confirmed by the model.")

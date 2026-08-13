@@ -28,6 +28,18 @@
 - AI가 생성한 패치나 payload는 자동 적용·자동 실행하지 마십시오.
 - `reviewed_confirmed` 판정에는 사람의 검토가 필요합니다.
 
+`analyze`의 기본 산출물은 분석 대상 밖에 매 실행 새로 만드는 비공개 운영체제 임시 디렉터리 `bob15-sast-artifacts-*`에 기록되며, `--output`이 대상 자체 또는 대상 하위 경로를 가리키면 거부됩니다. 별도 자동 정리 기능을 전제로 하지 말고, 산출물의 보존 기간과 접근 권한을 직접 관리하십시오. 로컬 분석기 실행은 안전한 프로세스 그룹 종료를 위해 POSIX에서만 허용되며, Windows에서는 외부에서 생성한 SARIF를 `ingest`하십시오.
+
+scanner 실행 파일은 대상 밖에 설치하십시오. PATH에서 찾은 실행 파일이 분석 대상 내부로 resolve되면 거부되므로 대상 저장소 내부의 가상환경에 Semgrep·CodeQL·Trivy를 설치하지 마십시오.
+
+OpenAI triage는 기본적으로 꺼져 있습니다. 활성화하면 root-cause group당 한 번 호출하며 기본 `--max-ai-groups`는 20입니다. 상한 초과는 첫 호출 전에 실패하지만, 이 상한은 token·청구 비용을 보장하지 않습니다. 더 낮은 실행 상한과 제공자 계정의 예산 제한을 함께 사용하고, `--include-source`는 전송 권한과 데이터 처리 조건을 확인한 뒤에만 사용하십시오.
+
+`demo`와 `analyze`는 기본적으로 finding 5,000개와 group 500개를 넘으면 산출물을 쓰기 전에 실패합니다. `--max-findings`와 `--max-groups`를 높일 때는 입력 신뢰도와 메모리·디스크·inode·사람 검토 용량을 먼저 확인하십시오.
+
+SARIF suppression은 신뢰 경계입니다. 현재 parser는 accepted suppression을 공개 finding의 `suppressed`와 group의 `suppressed_candidate`로 표시하지만 finding을 자동 제외하거나 안전하다고 판정하지 않습니다. `baseline_state`와 `baseline_absent`도 원본 상태 표시이며 baseline delta를 계산하지 않습니다. 외부 SARIF의 suppression과 baseline은 사람의 정책 검토 없이 보안 결론으로 사용하지 마십시오.
+
+Trivy 어댑터는 대상의 `trivy.yaml`과 `.trivyignore`를 신뢰하지 않고 대상 밖의 격리된 작업 디렉터리에서 명시적인 빈 config와 ignorefile을 사용합니다. CLI에서 `--scanner trivy`를 선택하면 대상 밖에 미리 채운 `--trivy-cache-dir`가 필수입니다. offline scan을 신뢰하기 전에 필요한 DB와 도구 자산이 사전에 준비되었는지 확인하십시오.
+
 ## 범위 밖 항목
 
 다음은 이 저장소의 보안 제보 대상이 아닙니다.

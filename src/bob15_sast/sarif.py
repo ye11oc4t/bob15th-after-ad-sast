@@ -28,20 +28,40 @@ _SEVERITY_WORDS = re.compile(
 MAX_SARIF_BYTES = 50 * 1024 * 1024
 MAX_RUNS = 1_000
 MAX_RULES = 100_000
-MAX_RESULTS = 100_000
-MAX_CODE_FLOWS = 100_000
+MAX_RESULTS = 10_000
+MAX_CODE_FLOWS = 10_000
 MAX_THREAD_FLOWS_PER_CODE_FLOW = 1_000
-MAX_TRACE_STEPS = 1_000_000
+MAX_TRACE_STEPS = 10_000
 MAX_LOCATIONS_PER_RESULT = 10_000
+MAX_RESULT_LOCATIONS = 20_000
+MAX_SUPPRESSIONS_PER_RESULT = 10_000
 MAX_URI_BASE_DEPTH = 64
-MAX_METADATA_NODES = 100_000
+MAX_METADATA_NODES = 2_000_000
 
 _UNSAFE_PATH = "<unsafe-path>"
+_EXTERNAL_PATH = "<external-path>"
 _MAX_URI_DECODE_PASSES = 8
+_EMPTY_RULE: Mapping[str, Any] = {}
 
 
 class SarifParseError(ValueError):
     """Raised when an input cannot be interpreted as a SARIF document."""
+
+
+@dataclass
+class _ParseBudget:
+    results: int = 0
+    code_flows: int = 0
+    trace_steps: int = 0
+    result_locations: int = 0
+    metadata_nodes: int = 0
+
+    def consume(self, field: str, amount: int, limit: int) -> None:
+        updated = getattr(self, field) + amount
+        if updated > limit:
+            label = field.replace("_", " ")
+            raise SarifParseError(f"SARIF exceeds the {label} limit ({limit})")
+        setattr(self, field, updated)
 
 
 def _message_text(value: Any) -> str:
@@ -54,15 +74,15 @@ def _message_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _walk_strings(value: Any) -> Iterable[str]:
+def _walk_strings(value: Any, *, budget: _ParseBudget | None = None) -> Iterable[str]:
     """Yield strings from JSON-like metadata without recursive traversal."""
 
+    active_budget = budget or _ParseBudget()
     stack = [value]
     visited_containers: set[int] = set()
-    visited_nodes = 0
-    while stack and visited_nodes < MAX_METADATA_NODES:
+    while stack:
         child = stack.pop()
-        visited_nodes += 1
+        active_budget.consume("metadata_nodes", 1, MAX_METADATA_NODES)
         if isinstance(child, str):
             yield child
             continue
@@ -80,12 +100,16 @@ def _walk_strings(value: Any) -> Iterable[str]:
             stack.extend(child)
 
 
-def extract_cwes(*values: Any) -> list[str]:
+def extract_cwes(
+    *values: Any,
+    _budget: _ParseBudget | None = None,
+) -> list[str]:
     """Extract and canonicalize CWE identifiers from arbitrary SARIF metadata."""
 
+    budget = _budget or _ParseBudget()
     found: set[str] = set()
     for value in values:
-        for text in _walk_strings(value):
+        for text in _walk_strings(value, budget=budget):
             # A string can contain more than one identifier, so scan each match
             # rather than relying on normalize_cwe's first-match behavior.
             for match in re.finditer(
@@ -150,51 +174,132 @@ def _mapping_value(mapping: Mapping[str, Any], dotted_key: str) -> Any:
     return cursor
 
 
-def normalize_severity(
-    result: Mapping[str, Any], rule: Mapping[str, Any] | None = None
-) -> Severity:
-    """Normalize SARIF and scanner-specific severity metadata."""
+_NUMERIC_SEVERITY_KEYS = (
+    "security-severity",
+    "security_severity",
+    "cvss",
+    "cvssScore",
+)
+_TEXT_SEVERITY_KEYS = ("severity", "impact", "problem.severity")
 
-    descriptor = rule or {}
-    result_props = result.get("properties") or {}
-    rule_props = descriptor.get("properties") or {}
-    if not isinstance(result_props, Mapping):
-        result_props = {}
-    if not isinstance(rule_props, Mapping):
-        rule_props = {}
 
-    # A CVSS-like security-severity score is more precise than SARIF's coarse
-    # error/warning/note level (important for CodeQL and Trivy).
-    for props in (result_props, rule_props):
-        for key in ("security-severity", "security_severity", "cvss", "cvssScore"):
-            severity = _severity_from_number(_mapping_value(props, key))
-            if severity is not None:
-                return severity
-
-    # Semgrep commonly places IMPACT in result/rule properties.
-    for props in (result_props, rule_props):
-        for key in ("severity", "impact", "problem.severity"):
-            severity = _severity_from_text(_mapping_value(props, key))
-            if severity is not None:
-                return severity
-
-    # Trivy commonly encodes severity in the rule tags.
-    for tag in _walk_strings(rule_props.get("tags", [])):
-        severity = _severity_from_text(tag)
-        if severity is not None and severity is not Severity.UNKNOWN:
-            return severity
-
-    level = result.get("level")
-    if level is None:
-        default_configuration = descriptor.get("defaultConfiguration") or {}
-        if isinstance(default_configuration, Mapping):
-            level = default_configuration.get("level")
+def _level_severity(value: Any) -> Severity:
     return {
         "error": Severity.HIGH,
         "warning": Severity.MEDIUM,
         "note": Severity.LOW,
         "none": Severity.INFO,
-    }.get(str(level).casefold(), Severity.UNKNOWN)
+    }.get(str(value).casefold(), Severity.UNKNOWN)
+
+
+def _first_property_severity(
+    properties: Mapping[str, Any],
+    keys: tuple[str, ...],
+    *,
+    numeric: bool,
+) -> Severity | None:
+    converter = _severity_from_number if numeric else _severity_from_text
+    for key in keys:
+        severity = converter(_mapping_value(properties, key))
+        if severity is not None:
+            return severity
+    return None
+
+
+@dataclass(frozen=True)
+class _RuleMetadata:
+    cwes: tuple[str, ...]
+    properties: dict[str, Any]
+    numeric_severity: Severity | None
+    text_severity: Severity | None
+    tag_severity: Severity | None
+    default_level_severity: Severity
+
+
+def _build_rule_metadata(
+    descriptor: Mapping[str, Any], budget: _ParseBudget
+) -> _RuleMetadata:
+    raw_properties = descriptor.get("properties") or {}
+    rule_properties = (
+        dict(raw_properties) if isinstance(raw_properties, Mapping) else {}
+    )
+    tag_severity = None
+    for tag in _walk_strings(rule_properties.get("tags", []), budget=budget):
+        candidate = _severity_from_text(tag)
+        if candidate is not None and candidate is not Severity.UNKNOWN:
+            tag_severity = candidate
+            break
+
+    default_configuration = descriptor.get("defaultConfiguration") or {}
+    default_level = (
+        default_configuration.get("level")
+        if isinstance(default_configuration, Mapping)
+        else None
+    )
+    return _RuleMetadata(
+        cwes=tuple(
+            extract_cwes(
+                rule_properties,
+                descriptor.get("help"),
+                descriptor.get("shortDescription"),
+                descriptor.get("fullDescription"),
+                _budget=budget,
+            )
+        ),
+        properties=rule_properties,
+        numeric_severity=_first_property_severity(
+            rule_properties, _NUMERIC_SEVERITY_KEYS, numeric=True
+        ),
+        text_severity=_first_property_severity(
+            rule_properties, _TEXT_SEVERITY_KEYS, numeric=False
+        ),
+        tag_severity=tag_severity,
+        default_level_severity=_level_severity(default_level),
+    )
+
+
+def _normalize_result_severity(
+    result: Mapping[str, Any],
+    rule_metadata: _RuleMetadata,
+) -> Severity:
+    raw_result_properties = result.get("properties") or {}
+    result_properties = (
+        raw_result_properties if isinstance(raw_result_properties, Mapping) else {}
+    )
+
+    # Preserve the precedence of the public normalizer: numeric scanner metadata
+    # wins over textual impact, and result metadata wins within each category.
+    result_numeric = _first_property_severity(
+        result_properties, _NUMERIC_SEVERITY_KEYS, numeric=True
+    )
+    if result_numeric is not None:
+        return result_numeric
+    if rule_metadata.numeric_severity is not None:
+        return rule_metadata.numeric_severity
+
+    result_text = _first_property_severity(
+        result_properties, _TEXT_SEVERITY_KEYS, numeric=False
+    )
+    if result_text is not None:
+        return result_text
+    if rule_metadata.text_severity is not None:
+        return rule_metadata.text_severity
+    if rule_metadata.tag_severity is not None:
+        return rule_metadata.tag_severity
+
+    if result.get("level") is not None:
+        return _level_severity(result.get("level"))
+    return rule_metadata.default_level_severity
+
+
+def normalize_severity(
+    result: Mapping[str, Any], rule: Mapping[str, Any] | None = None
+) -> Severity:
+    """Normalize SARIF and scanner-specific severity metadata."""
+
+    budget = _ParseBudget()
+    metadata = _build_rule_metadata(rule or {}, budget)
+    return _normalize_result_severity(result, metadata)
 
 
 def _base_uri(base_id: str | None, bases: Mapping[str, Any]) -> str | None:
@@ -229,12 +334,17 @@ def _base_uri(base_id: str | None, bases: Mapping[str, Any]) -> str | None:
     return resolved
 
 
-def _resolve_artifact_uri(
+def _artifact_location_with_identity(
     artifact_location: Mapping[str, Any],
     run: Mapping[str, Any],
-) -> str:
+) -> Mapping[str, Any] | None:
+    """Return an artifact location with a concrete URI identity, if available."""
+
     uri = artifact_location.get("uri")
-    if uri is None and isinstance(artifact_location.get("index"), int) and not isinstance(
+    if isinstance(uri, str) and uri.strip():
+        return artifact_location
+
+    if isinstance(artifact_location.get("index"), int) and not isinstance(
         artifact_location.get("index"), bool
     ):
         artifacts = run.get("artifacts") or []
@@ -244,15 +354,29 @@ def _resolve_artifact_uri(
             if isinstance(artifact, Mapping):
                 stored_location = artifact.get("location") or {}
                 if isinstance(stored_location, Mapping):
-                    # Explicit values on the physical location win.
-                    artifact_location = {**stored_location, **artifact_location}
-                    uri = artifact_location.get("uri")
-    uri = str(uri or "<unknown>")
+                    stored_uri = stored_location.get("uri")
+                    if isinstance(stored_uri, str) and stored_uri.strip():
+                        # Explicit base/index values on the physical location win,
+                        # while the artifact-table URI supplies its identity.
+                        resolved = {**stored_location, **artifact_location}
+                        resolved["uri"] = stored_uri
+                        return resolved
+    return None
+
+
+def _resolve_artifact_uri(
+    artifact_location: Mapping[str, Any],
+    run: Mapping[str, Any],
+) -> str | None:
+    resolved_location = _artifact_location_with_identity(artifact_location, run)
+    if resolved_location is None:
+        return None
+    uri = str(resolved_location["uri"])
     if _contains_parent_segment(uri):
         return _UNSAFE_PATH
     bases = run.get("originalUriBaseIds") or {}
     if isinstance(bases, Mapping):
-        base = _base_uri(artifact_location.get("uriBaseId"), bases)
+        base = _base_uri(resolved_location.get("uriBaseId"), bases)
         if base == _UNSAFE_PATH:
             return _UNSAFE_PATH
         if base:
@@ -324,6 +448,8 @@ def normalize_artifact_path(
     )
     if service_indexes:
         parts = parts[service_indexes[-1] + 1 :]
+    elif was_absolute:
+        return _EXTERNAL_PATH
 
     return "/".join(parts) or "<unknown>"
 
@@ -356,20 +482,6 @@ def _array(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
-@dataclass
-class _ParseBudget:
-    results: int = 0
-    code_flows: int = 0
-    trace_steps: int = 0
-
-    def consume(self, field: str, amount: int, limit: int) -> None:
-        updated = getattr(self, field) + amount
-        if updated > limit:
-            label = field.replace("_", " ")
-            raise SarifParseError(f"SARIF exceeds the {label} limit ({limit})")
-        setattr(self, field, updated)
-
-
 def _parse_location(
     location: Mapping[str, Any],
     *,
@@ -377,25 +489,35 @@ def _parse_location(
     service: str,
     repo_root: str | os.PathLike[str] | None,
 ) -> Location | None:
-    physical = location.get("physicalLocation") or {}
+    physical = location.get("physicalLocation")
     if not isinstance(physical, Mapping):
         return None
-    artifact = physical.get("artifactLocation") or {}
+    artifact = physical.get("artifactLocation")
     if not isinstance(artifact, Mapping):
-        artifact = {}
+        return None
     region = physical.get("region") or {}
     if not isinstance(region, Mapping):
         region = {}
     original_uri = _resolve_artifact_uri(artifact, run)
+    if original_uri is None:
+        return None
+    normalized_path = normalize_artifact_path(
+        original_uri, service=service, repo_root=repo_root
+    )
+    public_uri = (
+        normalized_path
+        if normalized_path in {_EXTERNAL_PATH, _UNSAFE_PATH}
+        else original_uri
+    )
     snippet = region.get("snippet")
     return Location(
-        path=normalize_artifact_path(original_uri, service=service, repo_root=repo_root),
+        path=normalized_path,
         line=_safe_line_number(region.get("startLine")),
         column=_safe_nonnegative_int(region.get("startColumn")),
         end_line=_safe_nonnegative_int(region.get("endLine")),
         end_column=_safe_nonnegative_int(region.get("endColumn")),
         snippet=_message_text(snippet) or None,
-        original_uri=original_uri,
+        original_uri=public_uri,
     )
 
 
@@ -500,10 +622,44 @@ def _rule_for_result(
     if rule_id is not None and str(rule_id) in by_id:
         return by_id[str(rule_id)]
     index = result.get("ruleIndex")
-    if isinstance(index, int) and 0 <= index < len(indexed):
+    if isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(indexed):
         return indexed[index]
     embedded = result.get("rule")
-    return embedded if isinstance(embedded, Mapping) else {}
+    return embedded if isinstance(embedded, Mapping) else _EMPTY_RULE
+
+
+def _add_result_state_properties(
+    result: Mapping[str, Any], properties: dict[str, Any]
+) -> None:
+    """Expose SARIF lifecycle state without hiding auditable results."""
+
+    raw_suppressions = result.get("suppressions")
+    suppressions = _array(raw_suppressions)
+    if len(suppressions) > MAX_SUPPRESSIONS_PER_RESULT:
+        raise SarifParseError(
+            "SARIF exceeds the suppressions per result limit "
+            f"({MAX_SUPPRESSIONS_PER_RESULT})"
+        )
+    if raw_suppressions is not None:
+        properties["sarif_suppressions"] = raw_suppressions
+    has_accepted_suppression = any(
+        isinstance(suppression, Mapping)
+        and str(suppression.get("status") or "").casefold() == "accepted"
+        for suppression in suppressions
+    )
+    properties["sarif_has_accepted_suppression"] = has_accepted_suppression
+
+    raw_baseline_state = result.get("baselineState")
+    baseline_state = str(raw_baseline_state or "").casefold()
+    valid_baseline_states = {"new", "unchanged", "updated", "absent"}
+    if raw_baseline_state is not None:
+        properties["sarif_baseline_state_raw"] = raw_baseline_state
+        properties["sarif_baseline_state"] = (
+            baseline_state if baseline_state in valid_baseline_states else "unknown"
+        )
+    properties["sarif_is_active"] = (
+        baseline_state != "absent" and not has_accepted_suppression
+    )
 
 
 def parse_sarif(
@@ -535,6 +691,7 @@ def parse_sarif(
             else "unknown"
         )
         by_id, indexed = _rules_for_run(run)
+        rule_metadata_cache: dict[int, tuple[Mapping[str, Any], _RuleMetadata]] = {}
 
         raw_results = _array(run.get("results"))
         budget.consume("results", len(raw_results), MAX_RESULTS)
@@ -548,6 +705,13 @@ def parse_sarif(
             }:
                 continue
             rule = _rule_for_result(result, by_id, indexed)
+            cache_key = id(rule)
+            cached = rule_metadata_cache.get(cache_key)
+            if cached is None or cached[0] is not rule:
+                rule_metadata = _build_rule_metadata(rule, budget)
+                rule_metadata_cache[cache_key] = (rule, rule_metadata)
+            else:
+                rule_metadata = cached[1]
             rule_id = str(result.get("ruleId") or rule.get("id") or "unknown-rule")
             raw_locations = _array(result.get("locations"))
             if len(raw_locations) > MAX_LOCATIONS_PER_RESULT:
@@ -555,6 +719,11 @@ def parse_sarif(
                     "SARIF exceeds the locations per result limit "
                     f"({MAX_LOCATIONS_PER_RESULT})"
                 )
+            budget.consume(
+                "result_locations",
+                len(raw_locations),
+                MAX_RESULT_LOCATIONS,
+            )
             locations = [
                 parsed
                 for raw in raw_locations
@@ -577,23 +746,20 @@ def parse_sarif(
                 budget=budget,
             )
             result_props = result.get("properties") or {}
-            rule_props = rule.get("properties") or {}
-            cwes = extract_cwes(
+            result_cwes = extract_cwes(
                 result_props,
-                rule_props,
-                rule.get("help"),
-                rule.get("shortDescription"),
-                rule.get("fullDescription"),
                 result.get("message"),
+                _budget=budget,
+            )
+            cwes = sorted(
+                {*rule_metadata.cwes, *result_cwes},
+                key=lambda cwe: int(cwe.split("-", 1)[1]),
             )
             properties = dict(result_props) if isinstance(result_props, Mapping) else {}
-            properties["sarif_rule_properties"] = (
-                dict(rule_props) if isinstance(rule_props, Mapping) else {}
-            )
+            properties["sarif_rule_properties"] = rule_metadata.properties
             if result.get("partialFingerprints") is not None:
                 properties["sarif_partial_fingerprints"] = result["partialFingerprints"]
-            if result.get("suppressions") is not None:
-                properties["sarif_suppressions"] = result["suppressions"]
+            _add_result_state_properties(result, properties)
 
             findings.append(
                 Finding(
@@ -602,7 +768,7 @@ def parse_sarif(
                     rule_id=rule_id,
                     rule_name=str(rule.get("name")) if rule.get("name") else None,
                     message=_message_text(result.get("message")),
-                    severity=normalize_severity(result, rule),
+                    severity=_normalize_result_severity(result, rule_metadata),
                     cwes=cwes,
                     locations=locations,
                     code_flows=code_flows,
