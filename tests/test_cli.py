@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
+import bob15_sast.cli as cli_module
 from bob15_sast.cli import app
 
 ROOT = Path(__file__).parents[1]
@@ -108,7 +109,7 @@ def test_analyze_rejects_platform_without_process_tree_kill(
 ) -> None:  # type: ignore[no-untyped-def]
     target = tmp_path / "target"
     target.mkdir()
-    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(cli_module, "os", SimpleNamespace(name="nt"))
     result = RUNNER.invoke(app, ["analyze", str(target)])
     assert result.exit_code == 2
     assert "requires POSIX process-group termination" in result.output
