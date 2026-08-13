@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from bob15_sast.cli import app
 
 ROOT = Path(__file__).parents[1]
 RUNNER = CliRunner()
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def test_doctor_succeeds_when_optional_tools_are_missing() -> None:
@@ -58,8 +60,9 @@ def test_analyze_requires_external_cache_for_offline_trivy(tmp_path: Path) -> No
     target.mkdir()
     result = RUNNER.invoke(app, ["analyze", str(target), "--scanner", "trivy"])
     assert result.exit_code != 0
-    assert "--trivy-cache-dir" in result.output
-    assert "required" in result.output
+    plain_output = ANSI_ESCAPE.sub("", result.output)
+    assert "--trivy-cache-dir" in plain_output
+    assert "required" in plain_output
 
 
 def test_analyze_rejects_trivy_cache_inside_target(tmp_path: Path) -> None:
