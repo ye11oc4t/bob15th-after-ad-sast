@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bob15th-after-ad-sast"
+version = "0.1.0"
+description = "Evidence-grounded AI-assisted SAST pipeline derived from a BoB 15th attack-and-defense retrospective"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Seoyeon Kim" }]
+dependencies = [
+  "pydantic>=2.8,<3",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.99,<3"]
+dev = [
+  "mypy>=1.11,<2",
+  "pytest>=8.2,<9",
+  "pytest-cov>=5,<7",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+bob15-sast = "bob15_sast.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bob15_sast"]
+
+[tool.hatch.build]
+include = [
+  "src/bob15_sast/**/*.py",
+  "src/bob15_sast/data/*.sarif",
+  "src/bob15_sast/data/*.yml",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["bob15_sast"]

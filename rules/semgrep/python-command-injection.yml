@@ -1,0 +1,42 @@
+rules:
+  - id: bob15.python.command-injection
+    message: >-
+      Untrusted input reaches a shell interpreter. Prefer an argument vector
+      with shell=False and validate values with an allow-list.
+    languages:
+      - python
+    severity: ERROR
+    mode: taint
+    metadata:
+      category: security
+      technology:
+        - python
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      cwe:
+        - "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      references:
+        - https://cwe.mitre.org/data/definitions/78.html
+      public_fixture: true
+    pattern-sources:
+      - pattern-either:
+          - pattern: input(...)
+          - pattern: request.args.get(...)
+          - pattern: request.form.get(...)
+          - pattern: flask.request.args.get(...)
+          - pattern: flask.request.form.get(...)
+      - patterns:
+          - pattern-inside: |
+              def $FUNCTION(..., $ARGUMENT, ...):
+                ...
+          - focus-metavariable: $ARGUMENT
+    pattern-sinks:
+      - pattern-either:
+          - pattern: os.system(...)
+          - pattern: os.popen(...)
+          - patterns:
+              - pattern: subprocess.$EXEC(..., shell=True, ...)
+              - metavariable-regex:
+                  metavariable: $EXEC
+                  regex: ^(run|call|check_call|check_output|Popen)$

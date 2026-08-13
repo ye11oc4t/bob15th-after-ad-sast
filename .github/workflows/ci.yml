@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BOB15_SAST_OFFLINE: "1"
+      NO_COLOR: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Lint
+        run: ruff check src tests
+      - name: Type check
+        run: mypy src/bob15_sast
+      - name: Check local environment
+        run: bob15-sast doctor
+      - name: Run synthetic demo
+        run: bob15-sast demo
+      - name: Parse sample SARIF
+        run: bob15-sast ingest fixtures/sarif/sample.sarif
+      - name: Build wheel
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Smoke-test wheel assets
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          cd "$(mktemp -d)"
+          bob15-sast demo --output demo-output
+
+  semgrep-rule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install Semgrep
+        run: python -m pip install semgrep
+      - name: Validate rule
+        run: semgrep --validate --config rules/semgrep/python-command-injection.yml
+      - name: Test rule
+        run: semgrep --test rules/semgrep

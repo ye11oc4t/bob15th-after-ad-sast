@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "SyntheticSemgrepExample",
+          "informationUri": "https://semgrep.dev/",
+          "semanticVersion": "0.1.0",
+          "rules": [
+            {
+              "id": "bob15.python.command-injection",
+              "name": "Synthetic command injection",
+              "shortDescription": {
+                "text": "Untrusted input reaches a shell command"
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/78.html",
+              "properties": {
+                "precision": "high",
+                "security-severity": "8.8",
+                "tags": [
+                  "security",
+                  "external/cwe/cwe-078"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "bob15.python.command-injection",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Synthetic untrusted input is concatenated into an os.system call."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "fixtures/synthetic/vulnerable.py",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "startLine": 15,
+                  "startColumn": 5,
+                  "endLine": 15,
+                  "endColumn": 62
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "synthetic-command-injection-v1"
+          },
+          "properties": {
+            "fixture": true,
+            "confirmation": "candidate",
+            "publicSafe": true
+          }
+        }
+      ]
+    }
+  ]
+}
