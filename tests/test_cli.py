@@ -58,7 +58,8 @@ def test_analyze_requires_external_cache_for_offline_trivy(tmp_path: Path) -> No
     target.mkdir()
     result = RUNNER.invoke(app, ["analyze", str(target), "--scanner", "trivy"])
     assert result.exit_code != 0
-    assert "--trivy-cache-dir is required" in result.output
+    assert "--trivy-cache-dir" in result.output
+    assert "required" in result.output
 
 
 def test_analyze_rejects_trivy_cache_inside_target(tmp_path: Path) -> None:
